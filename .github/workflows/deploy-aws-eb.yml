@@ -1,0 +1,89 @@
+
+name: Deploy React App to AWS Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: elasticbeanstalk-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      EB_APPLICATION_NAME: "EBS - Application"
+      EB_ENVIRONMENT_NAME: "EBS-Application-env"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React application
+        run: npm run build
+
+      - name: Package application
+        run: |
+          zip -r "$RUNNER_TEMP/deployment.zip" \
+            build server.js package.json package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload deployment package to S3
+        env:
+          S3_ARN: ${{ secrets.S3_ARN }}
+        run: |
+          S3_BUCKET="${S3_ARN#arn:aws:s3:::}"
+          S3_KEY="deployments/react-app-${GITHUB_SHA}.zip"
+
+          echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
+          echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
+
+          aws s3 cp "$RUNNER_TEMP/deployment.zip" \
+            "s3://$S3_BUCKET/$S3_KEY"
+
+      - name: Create Elastic Beanstalk application version
+        run: |
+          VERSION_LABEL="github-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+
+          echo "VERSION_LABEL=$VERSION_LABEL" >> "$GITHUB_ENV"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "$EB_APPLICATION_NAME" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY"
+
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "$EB_ENVIRONMENT_NAME" \
+            --version-label "$VERSION_LABEL"
+
+      - name: Wait for deployment to complete
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names "$EB_ENVIRONMENT_NAME"
+
+          echo "Deployment completed successfully."
