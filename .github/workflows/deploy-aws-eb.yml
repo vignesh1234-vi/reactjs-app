@@ -13,20 +13,20 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  EB_APPLICATION_NAME: "EBS - Application"
-  EB_ENVIRONMENT_NAME: "EBS-Application-env"
+  EB_ENVIRONMENT_NAME: EBS-Application-env
 
 jobs:
   deploy:
-    name: Build and Deploy to Elastic Beanstalk
+    name: Build and Deploy React App
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout source code
+
+      # 1. Checkout GitHub repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Configure Node.js
+      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -47,7 +47,7 @@ jobs:
           zip -r "$RUNNER_TEMP/deployment.zip" \
             build server.js package.json package-lock.json
 
-      # 6. Configure AWS credentials using GitHub OIDC
+      # 6. Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -59,29 +59,35 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-      # 8. Verify Elastic Beanstalk application and environment
-      - name: Verify Elastic Beanstalk resources
+      # 8. Retrieve application name from existing environment
+      - name: Get Elastic Beanstalk application name
         run: |
-          echo "Available Elastic Beanstalk applications:"
-          aws elasticbeanstalk describe-applications \
+          EB_APP=$(aws elasticbeanstalk describe-environments \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION" \
-            --query "Applications[].ApplicationName" \
+            --query "Environments[0].ApplicationName" \
+            --output text)
+
+          echo "Detected application name: [$EB_APP]"
+
+          if [ -z "$EB_APP" ] || [ "$EB_APP" = "None" ]; then
+            echo "ERROR: Could not find Elastic Beanstalk application."
+            exit 1
+          fi
+
+          echo "EB_APP=$EB_APP" >> "$GITHUB_ENV"
+
+      # 9. Verify environment
+      - name: Verify Elastic Beanstalk environment
+        run: |
+          aws elasticbeanstalk describe-environments \
+            --application-name "$EB_APP" \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --region "$AWS_REGION" \
+            --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health}" \
             --output table
 
-          echo "Checking application: $EB_APPLICATION_NAME"
-
-          aws elasticbeanstalk describe-applications \
-            --application-names "$EB_APPLICATION_NAME" \
-            --region "$AWS_REGION"
-
-          echo "Checking environment: $EB_ENVIRONMENT_NAME"
-
-          aws elasticbeanstalk describe-environments \
-            --application-name "$EB_APPLICATION_NAME" \
-            --environment-names "$EB_ENVIRONMENT_NAME" \
-            --region "$AWS_REGION"
-
-      # 9. Upload deployment package to S3
+      # 10. Upload deployment ZIP to S3
       - name: Upload deployment package to S3
         env:
           S3_ARN: ${{ vars.S3_ARN }}
@@ -96,7 +102,7 @@ jobs:
             "s3://$S3_BUCKET/$S3_KEY" \
             --region "$AWS_REGION"
 
-      # 10. Create Elastic Beanstalk application version
+      # 11. Create new Elastic Beanstalk application version
       - name: Create Elastic Beanstalk application version
         run: |
           VERSION_LABEL="github-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
@@ -104,35 +110,32 @@ jobs:
           echo "VERSION_LABEL=$VERSION_LABEL" >> "$GITHUB_ENV"
 
           aws elasticbeanstalk create-application-version \
-            --application-name "$EB_APPLICATION_NAME" \
+            --application-name "$EB_APP" \
             --version-label "$VERSION_LABEL" \
             --source-bundle \
               S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
             --region "$AWS_REGION"
 
-      # 11. Deploy application to Elastic Beanstalk
+      # 12. Deploy to existing environment
       - name: Deploy to Elastic Beanstalk
         run: |
           aws elasticbeanstalk update-environment \
-            --application-name "$EB_APPLICATION_NAME" \
             --environment-name "$EB_ENVIRONMENT_NAME" \
             --version-label "$VERSION_LABEL" \
             --region "$AWS_REGION"
 
-      # 12. Wait for deployment completion
+      # 13. Wait for deployment completion
       - name: Wait for deployment
         run: |
           aws elasticbeanstalk wait environment-updated \
-            --application-name "$EB_APPLICATION_NAME" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION"
 
-      # 13. Display deployment status
+      # 14. Display deployment result
       - name: Deployment status
         run: |
           aws elasticbeanstalk describe-environments \
-            --application-name "$EB_APPLICATION_NAME" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION" \
-            --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health,Version:VersionLabel}" \
+            --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health,Version:VersionLabel,URL:CNAME}" \
             --output table
