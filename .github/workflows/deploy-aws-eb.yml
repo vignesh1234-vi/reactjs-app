@@ -102,11 +102,12 @@ jobs:
             "s3://$S3_BUCKET/$S3_KEY" \
             --region "$AWS_REGION"
 
-      # 11. Create new Elastic Beanstalk application version
+      # 11. Create unique Elastic Beanstalk application version
       - name: Create Elastic Beanstalk application version
         run: |
-          VERSION_LABEL="github-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          VERSION_LABEL="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
 
+          echo "Creating application version: $VERSION_LABEL"
           echo "VERSION_LABEL=$VERSION_LABEL" >> "$GITHUB_ENV"
 
           aws elasticbeanstalk create-application-version \
@@ -120,6 +121,7 @@ jobs:
       - name: Deploy to Elastic Beanstalk
         run: |
           aws elasticbeanstalk update-environment \
+            --application-name "$EB_APP" \
             --environment-name "$EB_ENVIRONMENT_NAME" \
             --version-label "$VERSION_LABEL" \
             --region "$AWS_REGION"
@@ -128,6 +130,7 @@ jobs:
       - name: Wait for deployment
         run: |
           aws elasticbeanstalk wait environment-updated \
+            --application-name "$EB_APP" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION"
 
@@ -135,6 +138,7 @@ jobs:
       - name: Deployment status
         run: |
           aws elasticbeanstalk describe-environments \
+            --application-name "$EB_APP" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION" \
             --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health,Version:VersionLabel,URL:CNAME}" \
