@@ -45,6 +45,12 @@ jobs:
           zip -r "$RUNNER_TEMP/deployment.zip" \
             build server.js package.json package-lock.json
 
+      - name: Verify AWS role configuration
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF"
+          echo "AWS role variable is configured: ${{ vars.AWS_ROLE_ARN != '' }}"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
