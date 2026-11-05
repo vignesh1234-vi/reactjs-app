@@ -45,23 +45,18 @@ jobs:
           zip -r "$RUNNER_TEMP/deployment.zip" \
             build server.js package.json package-lock.json
 
-      - name: Verify AWS role configuration
-        run: |
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Branch: $GITHUB_REF"
-          echo "AWS role variable is configured: ${{ vars.AWS_ROLE_ARN != '' }}"
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::701179923193:role/GitHubActions-ElasticBeanstalk-Deploy-Role
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
       - name: Upload deployment package to S3
-        env:
-          S3_ARN: ${{ vars.S3_ARN }}
         run: |
-          S3_BUCKET="${S3_ARN#arn:aws:s3:::}"
+          S3_BUCKET="elasticbeanstalk-us-east-1-701179923193"
           S3_KEY="deployments/react-app-${GITHUB_SHA}.zip"
 
           echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
