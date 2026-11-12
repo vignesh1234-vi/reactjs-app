@@ -20,6 +20,11 @@ jobs:
     name: Build and Deploy React App
     runs-on: ubuntu-latest
 
+    # Prevent two deployments from running simultaneously
+    concurrency:
+      group: elasticbeanstalk-deployment
+      cancel-in-progress: false
+
     steps:
 
       # 1. Checkout GitHub repository
@@ -59,7 +64,7 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-      # 8. Retrieve application name from existing environment
+      # 8. Retrieve application name
       - name: Get Elastic Beanstalk application name
         run: |
           EB_APP=$(aws elasticbeanstalk describe-environments \
@@ -87,7 +92,25 @@ jobs:
             --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health}" \
             --output table
 
-      # 10. Upload deployment ZIP to S3
+      # 10. Capture currently running application version
+      - name: Capture previous application version
+        id: previous
+        run: |
+          PREVIOUS_VERSION=$(aws elasticbeanstalk describe-environments \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --region "$AWS_REGION" \
+            --query "Environments[0].VersionLabel" \
+            --output text)
+
+          if [ -z "$PREVIOUS_VERSION" ] || [ "$PREVIOUS_VERSION" = "None" ]; then
+            echo "ERROR: Previous application version not found."
+            exit 1
+          fi
+
+          echo "Previous version: $PREVIOUS_VERSION"
+          echo "version=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
+
+      # 11. Upload deployment ZIP to S3
       - name: Upload deployment package to S3
         env:
           S3_ARN: ${{ vars.S3_ARN }}
@@ -102,7 +125,7 @@ jobs:
             "s3://$S3_BUCKET/$S3_KEY" \
             --region "$AWS_REGION"
 
-      # 11. Create unique Elastic Beanstalk application version
+      # 12. Create unique Elastic Beanstalk application version
       - name: Create Elastic Beanstalk application version
         run: |
           VERSION_LABEL="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
@@ -117,8 +140,10 @@ jobs:
               S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
             --region "$AWS_REGION"
 
-      # 12. Deploy to existing environment
+      # 13. Deploy new application version
       - name: Deploy to Elastic Beanstalk
+        id: deploy
+        continue-on-error: true
         run: |
           aws elasticbeanstalk update-environment \
             --application-name "$EB_APP" \
@@ -126,16 +151,109 @@ jobs:
             --version-label "$VERSION_LABEL" \
             --region "$AWS_REGION"
 
-      # 13. Wait for deployment completion
+      # 14. Wait for deployment completion
       - name: Wait for deployment
+        id: wait
+        if: steps.deploy.outcome == 'success'
+        continue-on-error: true
         run: |
           aws elasticbeanstalk wait environment-updated \
             --application-name "$EB_APP" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
             --region "$AWS_REGION"
 
-      # 14. Display deployment result
+      # 15. Verify application health
+      - name: Verify application health
+        id: health_check
+        if: always() && steps.deploy.outcome == 'success' && steps.wait.outcome == 'success'
+        continue-on-error: true
+        run: |
+          echo "Checking Elastic Beanstalk environment health..."
+
+          HEALTH=""
+          STATUS=""
+
+          for attempt in {1..12}; do
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENVIRONMENT_NAME" \
+              --region "$AWS_REGION" \
+              --query "Environments[0].Health" \
+              --output text)
+
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENVIRONMENT_NAME" \
+              --region "$AWS_REGION" \
+              --query "Environments[0].Status" \
+              --output text)
+
+            echo "Attempt $attempt: Health=$HEALTH Status=$STATUS"
+
+            if [ "$HEALTH" = "Green" ] && [ "$STATUS" = "Ready" ]; then
+              break
+            fi
+
+            sleep 15
+          done
+
+          if [ "$HEALTH" != "Green" ] || [ "$STATUS" != "Ready" ]; then
+            echo "Application environment is not healthy."
+            exit 1
+          fi
+
+          CNAME=$(aws elasticbeanstalk describe-environments \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --region "$AWS_REGION" \
+            --query "Environments[0].CNAME" \
+            --output text)
+
+          APP_URL="http://${CNAME}"
+
+          echo "Checking application URL: $APP_URL"
+
+          for attempt in {1..10}; do
+            if curl -LfsS --max-time 15 "$APP_URL" -o /dev/null; then
+              echo "Application HTTP health check passed."
+              exit 0
+            fi
+
+            echo "HTTP check failed. Retrying..."
+            sleep 10
+          done
+
+          echo "Application HTTP health check failed."
+          exit 1
+
+      # 16. Automatic rollback to previous version
+      - name: Automatic rollback
+        id: rollback
+        if: always() && (steps.deploy.outcome == 'failure' || steps.wait.outcome == 'failure' || steps.health_check.outcome == 'failure')
+        run: |
+          PREVIOUS_VERSION="${{ steps.previous.outputs.version }}"
+
+          if [ -z "$PREVIOUS_VERSION" ]; then
+            echo "ERROR: Previous version is unavailable. Cannot rollback."
+            exit 1
+          fi
+
+          echo "New deployment failed."
+          echo "Restoring previous version: $PREVIOUS_VERSION"
+
+          aws elasticbeanstalk update-environment \
+            --application-name "$EB_APP" \
+            --environment-name "$EB_ENVIRONMENT_NAME" \
+            --version-label "$PREVIOUS_VERSION" \
+            --region "$AWS_REGION"
+
+          aws elasticbeanstalk wait environment-updated \
+            --application-name "$EB_APP" \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --region "$AWS_REGION"
+
+          echo "Previous application version restored."
+
+      # 17. Display successful deployment result
       - name: Deployment status
+        if: steps.deploy.outcome == 'success' && steps.wait.outcome == 'success' && steps.health_check.outcome == 'success'
         run: |
           aws elasticbeanstalk describe-environments \
             --application-name "$EB_APP" \
@@ -143,3 +261,10 @@ jobs:
             --region "$AWS_REGION" \
             --query "Environments[].{Application:ApplicationName,Environment:EnvironmentName,Status:Status,Health:Health,Version:VersionLabel,URL:CNAME}" \
             --output table
+
+      # 18. Mark deployment as failed if rollback was triggered
+      - name: Report deployment failure
+        if: always() && (steps.deploy.outcome == 'failure' || steps.wait.outcome == 'failure' || steps.health_check.outcome == 'failure')
+        run: |
+          echo "New deployment failed. Automatic rollback was attempted."
+          exit 1
