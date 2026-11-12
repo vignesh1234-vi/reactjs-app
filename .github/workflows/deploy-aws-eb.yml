@@ -168,8 +168,6 @@ jobs:
         if: always() && steps.deploy.outcome == 'success' && steps.wait.outcome == 'success'
         continue-on-error: true
         run: |
-          echo "TEST: Simulating application health-check failure"
-          exit 1
           echo "Checking Elastic Beanstalk environment health..."
 
           HEALTH=""
